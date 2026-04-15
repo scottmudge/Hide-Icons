@@ -11,6 +11,10 @@
 #define IDC_HOTKEY_EDIT                2001
 #define IDC_CLEAR_BUTTON               2004
 
+#define IDD_AUTOHIDE_DIALOG            2000
+#define IDC_AUTOHIDE_SECONDS_EDIT      2005
+#define IDC_AUTOHIDE_MINMOUSE_EDIT     2006
+
 // Next default values for new objects
 // 
 #ifdef APSTUDIO_INVOKED
