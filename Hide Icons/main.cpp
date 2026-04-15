@@ -1,4 +1,5 @@
-﻿#include "resource.h"
+﻿#define OEMRESOURCE // Required for OCR_ system cursor constants
+#include "resource.h"
 #include <windows.h>
 #include <shellapi.h>
 #include <shlwapi.h>
@@ -16,13 +17,13 @@
 #pragma comment(lib, "OleAut32.lib")
 
 struct HotkeyConfig {
-    UINT hotkey;          // Virtual key code for the hotkey (e.g., VK_F1, VK_A, etc.)
-    UINT modifier;        // Modifier key (e.g., MOD_SHIFT, MOD_CONTROL, MOD_ALT)
+    UINT hotkey;
+    UINT modifier;
 };
 
 struct AutoHideConfig {
-    UINT inactivitySeconds;   // Seconds of inactivity before hiding icons (0 = disabled)
-    UINT minMouseMovement;    // Minimum pixel movement (accumulated over 1s) to un-hide icons
+    UINT inactivitySeconds;
+    UINT minMouseMovement;
 };
 
 // Global variables
@@ -33,31 +34,26 @@ bool g_isStartup = false;
 HHOOK g_hKeyboardHook = nullptr;
 HHOOK g_hMouseHook = nullptr;
 HotkeyConfig g_hotkey = { 0, 0 };
-AutoHideConfig g_autoHide = { 0, 25 }; // Default: disabled, 25px threshold
+AutoHideConfig g_autoHide = { 0, 25 };
 std::wstring customIconPath;
 
 // Auto-hide state
 #define TIMER_ID_AUTOHIDE   1
-#define TIMER_INTERVAL_MS   500   // Poll every 500ms
+#define TIMER_INTERVAL_MS   500
 
-// Icons are considered hidden when this is true (tracks the *logical* state we set,
-// since the registry HideIcons value is toggled by SendMessage and we can't read it
-// synchronously after the toggle).
 bool g_iconsHidden = false;
 
-// Mouse movement accumulator — reset every 1 second by the polling timer
 static LONG g_mouseAccumX = 0;
 static LONG g_mouseAccumY = 0;
-static DWORD g_mouseAccumResetTick = 0; // tick of the last 1-second reset
+static DWORD g_mouseAccumResetTick = 0;
 
 const wchar_t* APP_NAME = L"Hide Icons";
-const wchar_t* APP_VERSION = L"v1.9.0";
+const wchar_t* APP_VERSION = L"v1.9.2";
 
-// Registry keys
+// Registry keys (Only used for app settings now)
 const wchar_t* REG_PATH = L"SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Run";
 const wchar_t* SETTINGS_REG_PATH = L"SOFTWARE\\Hide Icons";
 const wchar_t* ICON_VALUE_NAME = L"CustomIcon";
-const wchar_t* DESKTOP_ICON_STATE = L"DesktopIconsState";
 const wchar_t* HOTKEY_VALUE_NAME = L"Hotkey";
 const wchar_t* HOTKEY_MODIFIER_VALUE_NAME = L"HotkeyModifier";
 const wchar_t* AUTOHIDE_SECONDS_VALUE_NAME = L"AutoHideSeconds";
@@ -66,15 +62,13 @@ const wchar_t* AUTOHIDE_MINMOUSE_VALUE_NAME = L"AutoHideMinMouseMovement";
 HICON hBlackIcon = (HICON)LoadImage(GetModuleHandle(nullptr), MAKEINTRESOURCE(IDI_ICON2), IMAGE_ICON, 0, 0, LR_DEFAULTSIZE);
 HICON hWhiteIcon = (HICON)LoadImage(GetModuleHandle(nullptr), MAKEINTRESOURCE(IDI_ICON3), IMAGE_ICON, 0, 0, LR_DEFAULTSIZE);
 
-// Define WM_TASKBARCREATED
 UINT WM_TASKBARCREATED = RegisterWindowMessage(L"TaskbarCreated");
 
-// Forward declarations
 void ToggleDesktopIcons();
 bool AreDesktopIconsCurrentlyVisible();
 
 // ─────────────────────────────────────────────────────────────────────────────
-// COM-based way to get the real SHELLDLL_DefView window
+// Desktop Window Discovery
 // ─────────────────────────────────────────────────────────────────────────────
 static HWND GetDefViewByCOM()
 {
@@ -113,7 +107,6 @@ static HWND GetDefViewByCOM()
     return hwndDefView;
 }
 
-// Fallback scanner to find SHELLDLL_DefView if COM path fails
 static HWND GetDefViewByScan()
 {
     HWND defView = nullptr;
@@ -129,22 +122,8 @@ static HWND GetDefViewByScan()
     return nullptr;
 }
 
-// Helper to read actual user HideIcons value for state reflection
-static bool ReadHideIconsReg(bool& visibleOut)
-{
-    DWORD val = 0, type = 0, cb = sizeof(DWORD);
-    if (RegGetValueW(HKEY_CURRENT_USER,
-        L"Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\Advanced",
-        L"HideIcons", RRF_RT_REG_DWORD, &type, &val, &cb) == ERROR_SUCCESS)
-    {
-        visibleOut = (val == 0);
-        return true;
-    }
-    return false;
-}
-
 // ─────────────────────────────────────────────────────────────────────────────
-// Registry: Hotkey
+// App Settings Registry
 // ─────────────────────────────────────────────────────────────────────────────
 void SaveHotkey(const HotkeyConfig& config) {
     HKEY hKey;
@@ -168,9 +147,6 @@ HotkeyConfig LoadHotkey() {
     return config;
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Registry: AutoHide settings
-// ─────────────────────────────────────────────────────────────────────────────
 void SaveAutoHideConfig(const AutoHideConfig& config) {
     HKEY hKey;
     if (RegCreateKeyEx(HKEY_CURRENT_USER, SETTINGS_REG_PATH, 0, nullptr, 0, KEY_WRITE, nullptr, &hKey, nullptr) == ERROR_SUCCESS) {
@@ -182,7 +158,7 @@ void SaveAutoHideConfig(const AutoHideConfig& config) {
 
 AutoHideConfig LoadAutoHideConfig() {
     HKEY hKey;
-    AutoHideConfig config = { 0, 25 }; // defaults
+    AutoHideConfig config = { 0, 25 };
     if (RegOpenKeyEx(HKEY_CURRENT_USER, SETTINGS_REG_PATH, 0, KEY_READ, &hKey) == ERROR_SUCCESS) {
         DWORD dwType = 0, dwSize = sizeof(DWORD);
         RegQueryValueEx(hKey, AUTOHIDE_SECONDS_VALUE_NAME, 0, &dwType, (LPBYTE)&config.inactivitySeconds, &dwSize);
@@ -194,26 +170,14 @@ AutoHideConfig LoadAutoHideConfig() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// AutoHide settings dialog
+// Dialogs
 // ─────────────────────────────────────────────────────────────────────────────
-
-// Dialog resource IDs — add these to your .rc file:
-//   IDD_AUTOHIDE_DIALOG   a dialog with:
-//     IDC_AUTOHIDE_SECONDS_EDIT   EDITTEXT  (number, 0 = disable)
-//     IDC_AUTOHIDE_MINMOUSE_EDIT  EDITTEXT  (number in pixels)
-//     IDOK / IDCANCEL             PUSHBUTTONs
-//
-// If you prefer, you can build the dialog in code (see the WM_INITDIALOG note
-// in the proc below) — but a resource dialog is cleaner.
-
 LRESULT CALLBACK AutoHideDialogProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) {
     switch (message) {
     case WM_INITDIALOG: {
-        // Populate fields with current values
         SetDlgItemInt(hWnd, IDC_AUTOHIDE_SECONDS_EDIT, g_autoHide.inactivitySeconds, FALSE);
         SetDlgItemInt(hWnd, IDC_AUTOHIDE_MINMOUSE_EDIT, g_autoHide.minMouseMovement, FALSE);
 
-        // Position dialog near the cursor
         POINT cursorPos;
         GetCursorPos(&cursorPos);
         cursorPos.x += 20;
@@ -241,7 +205,7 @@ LRESULT CALLBACK AutoHideDialogProc(HWND hWnd, UINT message, WPARAM wParam, LPAR
             if (!translated) seconds = 0;
 
             UINT minMouse = GetDlgItemInt(hWnd, IDC_AUTOHIDE_MINMOUSE_EDIT, &translated, FALSE);
-            if (!translated || minMouse < 1) minMouse = 1; // at least 1 px
+            if (!translated || minMouse < 1) minMouse = 1;
 
             g_autoHide.inactivitySeconds = seconds;
             g_autoHide.minMouseMovement = minMouse;
@@ -265,14 +229,10 @@ void SetAutoHide(HWND hWnd) {
     DialogBox(g_hInstance, MAKEINTRESOURCE(IDD_AUTOHIDE_DIALOG), hWnd, AutoHideDialogProc);
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Hotkey dialog (unchanged from original)
-// ─────────────────────────────────────────────────────────────────────────────
 LRESULT CALLBACK HotkeyDialogProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) {
     switch (message) {
     case WM_INITDIALOG: {
-        SendDlgItemMessage(hWnd, IDC_HOTKEY_EDIT, HKM_SETHOTKEY,
-            MAKEWORD(g_hotkey.hotkey, g_hotkey.modifier), 0);
+        SendDlgItemMessage(hWnd, IDC_HOTKEY_EDIT, HKM_SETHOTKEY, MAKEWORD(g_hotkey.hotkey, g_hotkey.modifier), 0);
 
         POINT cursorPos;
         GetCursorPos(&cursorPos);
@@ -340,7 +300,7 @@ void RemoveHotkey(HWND hWnd) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Theme / startup helpers (unchanged)
+// Tray & Startup
 // ─────────────────────────────────────────────────────────────────────────────
 bool IsTaskbarDarkMode() {
     HKEY hKey;
@@ -384,9 +344,6 @@ void ToggleStartup() {
     g_isStartup = !g_isStartup;
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Custom icon helpers (unchanged)
-// ─────────────────────────────────────────────────────────────────────────────
 void SaveCustomIconPath(const wchar_t* iconPath) {
     HKEY key;
     if (RegCreateKeyEx(HKEY_CURRENT_USER, SETTINGS_REG_PATH, 0, nullptr, 0, KEY_WRITE, nullptr, &key, nullptr) == ERROR_SUCCESS) {
@@ -410,20 +367,6 @@ bool LoadCustomIconPath(std::wstring& iconPath) {
     return false;
 }
 
-bool GetDesktopIconsRegistryState() {
-    HKEY key;
-    BYTE state;
-    DWORD stateSize = sizeof(state);
-    if (RegOpenKeyEx(HKEY_CURRENT_USER, SETTINGS_REG_PATH, 0, KEY_READ, &key) == ERROR_SUCCESS) {
-        if (RegQueryValueEx(key, DESKTOP_ICON_STATE, nullptr, nullptr, &state, &stateSize) == ERROR_SUCCESS) {
-            RegCloseKey(key);
-            return state != 0;
-        }
-        RegCloseKey(key);
-    }
-    return false;
-}
-
 void ChangeTrayIcon() {
     wchar_t filePath[MAX_PATH] = {};
     OPENFILENAME ofn = {};
@@ -440,9 +383,6 @@ void ChangeTrayIcon() {
             g_nid.hIcon = hNewIcon;
             Shell_NotifyIcon(NIM_MODIFY, &g_nid);
             SaveCustomIconPath(filePath);
-        }
-        else {
-            MessageBox(nullptr, L"Failed to load the icon.", L"Error", MB_ICONERROR);
         }
     }
 }
@@ -485,54 +425,115 @@ void RemoveTrayIcon() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Desktop icon visibility helpers
+// True Stealth Visibility & Cursor Control (Zero Flicker)
 // ─────────────────────────────────────────────────────────────────────────────
 
-// Read the actual Explorer registry state: true = visible, false = hidden
-bool AreDesktopIconsCurrentlyVisible() {
-    bool visible = true;
-    ReadHideIconsReg(visible);
-    return visible;
+// Arrays to cache system cursors directly in memory
+HCURSOR g_savedCursors[13] = { nullptr };
+const DWORD g_cursorIDs[13] = {
+    OCR_NORMAL, OCR_IBEAM, OCR_WAIT, OCR_CROSS, OCR_UP, OCR_SIZENWSE,
+    OCR_SIZENESW, OCR_SIZEWE, OCR_SIZENS, OCR_SIZEALL, OCR_NO, OCR_HAND,
+    OCR_APPSTARTING
+};
+
+void SetCursorVisibility(bool show) {
+    static bool isHidden = false;
+
+    if (show && isHidden) {
+        // Restore locally stored cursors without sending a system-wide broadcast
+        for (int i = 0; i < 13; ++i) {
+            if (g_savedCursors[i]) {
+                // SetSystemCursor eats handles, so we provide an identical copy of our cache
+                HCURSOR hCopy = (HCURSOR)CopyImage(g_savedCursors[i], IMAGE_CURSOR, 0, 0, 0);
+                SetSystemCursor(hCopy, g_cursorIDs[i]);
+            }
+        }
+        isHidden = false;
+    }
+    else if (!show && !isHidden) {
+        // Cache originals if not done yet
+        for (int i = 0; i < 13; ++i) {
+            if (!g_savedCursors[i]) {
+                HANDLE hSysCursor = LoadImage(nullptr, MAKEINTRESOURCE(g_cursorIDs[i]), IMAGE_CURSOR, 0, 0, LR_SHARED);
+                g_savedCursors[i] = (HCURSOR)CopyImage(hSysCursor, IMAGE_CURSOR, 0, 0, 0);
+            }
+        }
+
+        // Create transparent cursors
+        BYTE ANDmaskCursor[128];
+        memset(ANDmaskCursor, 0xFF, sizeof(ANDmaskCursor));
+        BYTE XORmaskCursor[128];
+        memset(XORmaskCursor, 0x00, sizeof(XORmaskCursor));
+
+        for (DWORD id : g_cursorIDs) {
+            HCURSOR hInvisibleCursor = CreateCursor(nullptr, 0, 0, 32, 32, ANDmaskCursor, XORmaskCursor);
+            SetSystemCursor(hInvisibleCursor, id);
+        }
+        isHidden = true;
+    }
 }
 
-// Toggle icons and keep g_iconsHidden in sync
-void ToggleDesktopIcons() {
+void CleanupCursors() {
+    for (int i = 0; i < 13; ++i) {
+        if (g_savedCursors[i]) {
+            DestroyCursor(g_savedCursors[i]);
+            g_savedCursors[i] = nullptr;
+        }
+    }
+}
+
+void SetDesktopIconsVisibility(bool show) {
     HWND defView = GetDefViewByCOM();
     if (!defView) defView = GetDefViewByScan();
     if (!defView) return;
 
-    PostMessage(defView, WM_COMMAND, 29698, 0);
-
-    // Flip our logical state
-    g_iconsHidden = !g_iconsHidden;
+    HWND hListView = FindWindowExW(defView, nullptr, L"SysListView32", nullptr);
+    if (hListView) {
+        // Direct API visibility toggle. No registry touch, no shell broadcast.
+        ShowWindow(hListView, show ? SW_SHOW : SW_HIDE);
+    }
 }
 
-// Hide icons (only if currently visible)
+// Interrogates the actual window rather than the registry
+bool AreDesktopIconsCurrentlyVisible() {
+    HWND defView = GetDefViewByCOM();
+    if (!defView) defView = GetDefViewByScan();
+    if (defView) {
+        HWND hListView = FindWindowExW(defView, nullptr, L"SysListView32", nullptr);
+        if (hListView) {
+            return IsWindowVisible(hListView) != 0;
+        }
+    }
+    return true; // Assume visible if we fail to find the handle
+}
+
 void HideDesktopIcons() {
     if (!g_iconsHidden) {
-        ToggleDesktopIcons();
+        g_iconsHidden = true;
+        SetDesktopIconsVisibility(false);
+        SetCursorVisibility(false);
     }
 }
 
-// Show icons (only if currently hidden)
 void ShowDesktopIcons() {
     if (g_iconsHidden) {
-        ToggleDesktopIcons();
+        g_iconsHidden = false;
+        SetDesktopIconsVisibility(true);
+        SetCursorVisibility(true);
     }
+}
+
+void ToggleDesktopIcons() {
+    g_iconsHidden = !g_iconsHidden;
+    SetDesktopIconsVisibility(!g_iconsHidden);
+    SetCursorVisibility(!g_iconsHidden);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Low-level mouse hook — PASSIVE accumulator only
-//
-// This hook never calls anything other than CallNextHookEx, so it has
-// zero effect on what other applications / games receive.
+// Hooks & Timers
 // ─────────────────────────────────────────────────────────────────────────────
 LRESULT CALLBACK LowLevelMouseProc(int nCode, WPARAM wParam, LPARAM lParam) {
     if (nCode == HC_ACTION && wParam == WM_MOUSEMOVE) {
-        // lParam is a pointer to MSLLHOOKSTRUCT; we only read the delta
-        // fields using RAWMOUSE-style deltas by comparing successive positions.
-        // However MSLLHOOKSTRUCT gives screen coordinates, not deltas.
-        // We compute deltas ourselves from consecutive positions.
         static LONG lastX = LONG_MIN, lastY = LONG_MIN;
         MSLLHOOKSTRUCT* p = reinterpret_cast<MSLLHOOKSTRUCT*>(lParam);
 
@@ -540,7 +541,6 @@ LRESULT CALLBACK LowLevelMouseProc(int nCode, WPARAM wParam, LPARAM lParam) {
             LONG dx = p->pt.x - lastX;
             LONG dy = p->pt.y - lastY;
 
-            // Reset accumulator every 1 second
             DWORD now = GetTickCount();
             if (now - g_mouseAccumResetTick >= 1000) {
                 g_mouseAccumX = 0;
@@ -548,20 +548,15 @@ LRESULT CALLBACK LowLevelMouseProc(int nCode, WPARAM wParam, LPARAM lParam) {
                 g_mouseAccumResetTick = now;
             }
 
-            // Accumulate absolute deltas
             g_mouseAccumX += (dx < 0 ? -dx : dx);
             g_mouseAccumY += (dy < 0 ? -dy : dy);
         }
         lastX = p->pt.x;
         lastY = p->pt.y;
     }
-    // Always pass to next hook — we never consume anything
     return CallNextHookEx(g_hMouseHook, nCode, wParam, lParam);
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Low-level keyboard hook (unchanged logic, kept passive)
-// ─────────────────────────────────────────────────────────────────────────────
 LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lParam) {
     if (nCode == HC_ACTION) {
         KBDLLHOOKSTRUCT* pKeyInfo = (KBDLLHOOKSTRUCT*)lParam;
@@ -599,26 +594,8 @@ void UninstallMouseHook() {
     if (g_hMouseHook) { UnhookWindowsHookEx(g_hMouseHook); g_hMouseHook = nullptr; }
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Auto-hide polling timer
-//
-// Called every TIMER_INTERVAL_MS (500ms).
-//
-// Logic:
-//   • If auto-hide is enabled and icons are currently visible:
-//       – Ask Windows how long since last keyboard/mouse input (GetLastInputInfo).
-//       – If idle >= inactivitySeconds → hide icons.
-//
-//   • If icons are currently hidden:
-//       – Check accumulated mouse movement over the last 1-second window.
-//       – If movement >= minMouseMovement → show icons (reset accumulator).
-//       – Any keyboard activity (GetLastInputInfo reset) also un-hides.
-//
-// GetLastInputInfo is a simple non-blocking query; it has NO effect on the
-// input queue and is safe to call from any thread / at any frequency.
-// ─────────────────────────────────────────────────────────────────────────────
 void OnAutoHideTimer() {
-    if (g_autoHide.inactivitySeconds == 0) return; // feature disabled
+    if (g_autoHide.inactivitySeconds == 0) return;
 
     LASTINPUTINFO lii;
     lii.cbSize = sizeof(LASTINPUTINFO);
@@ -627,17 +604,13 @@ void OnAutoHideTimer() {
     DWORD idleMs = GetTickCount() - lii.dwTime;
 
     if (!g_iconsHidden) {
-        // --- Hide path ---
         if (idleMs >= g_autoHide.inactivitySeconds * 1000U) {
             HideDesktopIcons();
         }
     }
     else {
-        // --- Show path ---
-        // Un-hide on sufficient mouse movement
         LONG totalMovement = g_mouseAccumX + g_mouseAccumY;
         if (totalMovement >= (LONG)g_autoHide.minMouseMovement) {
-            // Reset accumulator so we don't fire repeatedly
             g_mouseAccumX = 0;
             g_mouseAccumY = 0;
             g_mouseAccumResetTick = GetTickCount();
@@ -645,9 +618,6 @@ void OnAutoHideTimer() {
             return;
         }
 
-        // Also un-hide on any keyboard activity (idle time resets on key press)
-        // We consider "recent activity" as idle < 500ms while icons are hidden.
-        // This means a key press will un-hide within one timer tick (500ms).
         if (idleMs < 500) {
             ShowDesktopIcons();
         }
@@ -690,7 +660,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) 
         case 3:  ResetTrayIcon();     break;
         case 4:  SetHotkey(hWnd);     break;
         case 5:  RemoveHotkey(hWnd);  break;
-        case 6:  SetAutoHide(hWnd);   break;   // NEW
+        case 6:  SetAutoHide(hWnd);   break;
         case 7:
             MessageBox(hWnd, (L"Hide Icons " + std::wstring(APP_VERSION) + L"\nCreated by emp0ry").c_str(), L"About", MB_OK | MB_ICONINFORMATION);
             break;
@@ -705,8 +675,10 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) 
         break;
 
     case WM_DESTROY:
+        ShowDesktopIcons();
         KillTimer(hWnd, TIMER_ID_AUTOHIDE);
         RemoveTrayIcon();
+        CleanupCursors();
         PostQuitMessage(0);
         break;
 
@@ -728,12 +700,8 @@ int APIENTRY wWinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE hPrevInstance
 
     g_hInstance = hInstance;
 
-    // Sync g_iconsHidden with the actual current Explorer state at startup
-    {
-        bool visible = true;
-        ReadHideIconsReg(visible);
-        g_iconsHidden = !visible;
-    }
+    // Sync logical state directly with the active window visibility
+    g_iconsHidden = !AreDesktopIconsCurrentlyVisible();
 
     WNDCLASS wc = {};
     wc.lpfnWndProc = WndProc;
@@ -747,17 +715,14 @@ int APIENTRY wWinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE hPrevInstance
     g_hotkey = LoadHotkey();
     g_autoHide = LoadAutoHideConfig();
 
-    // Initialise the mouse-movement accumulator timestamp
     g_mouseAccumResetTick = GetTickCount();
 
     InstallKeyboardHook();
     InstallMouseHook();
     CreateTrayIcon(hWnd);
 
-    // Start the polling timer (fires every 500ms)
     SetTimer(hWnd, TIMER_ID_AUTOHIDE, TIMER_INTERVAL_MS, nullptr);
 
-    // ── Context menu ──────────────────────────────────────────────────────────
     g_hMenu = CreatePopupMenu();
     AppendMenu(g_hMenu, MF_STRING, 1, L"Run at Startup");
     AppendMenu(g_hMenu, MF_SEPARATOR, 0, nullptr);
@@ -767,7 +732,7 @@ int APIENTRY wWinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE hPrevInstance
     AppendMenu(g_hMenu, MF_STRING, 4, L"Set Hotkey");
     AppendMenu(g_hMenu, MF_STRING, 5, L"Remove Hotkey");
     AppendMenu(g_hMenu, MF_SEPARATOR, 0, nullptr);
-    AppendMenu(g_hMenu, MF_STRING, 6, L"Auto-Hide Settings");   // NEW
+    AppendMenu(g_hMenu, MF_STRING, 6, L"Auto-Hide Settings");
     AppendMenu(g_hMenu, MF_SEPARATOR, 0, nullptr);
     AppendMenu(g_hMenu, MF_STRING, 7, L"About");
     AppendMenu(g_hMenu, MF_SEPARATOR, 0, nullptr);
