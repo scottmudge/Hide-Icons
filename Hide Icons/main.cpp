@@ -22,8 +22,10 @@ struct HotkeyConfig {
 };
 
 struct AutoHideConfig {
-    UINT inactivitySeconds;
-    UINT minMouseMovement;
+    UINT  inactivitySeconds;
+    UINT  minMouseMovement;
+    bool  enableAutoHide;   // master on/off for the auto-hide feature
+    bool  hideCursor;       // whether to also hide the cursor in auto-hide mode
 };
 
 // Global variables
@@ -34,7 +36,7 @@ bool g_isStartup = false;
 HHOOK g_hKeyboardHook = nullptr;
 HHOOK g_hMouseHook = nullptr;
 HotkeyConfig g_hotkey = { 0, 0 };
-AutoHideConfig g_autoHide = { 0, 25 };
+AutoHideConfig g_autoHide = { 0, 25, true, true };
 std::wstring customIconPath;
 
 // Auto-hide state
@@ -43,14 +45,20 @@ std::wstring customIconPath;
 
 bool g_iconsHidden = false;
 
+// When true, the icons were hidden by the hotkey – only the hotkey can show
+// them again.  Auto-hide logic is completely suppressed in this state.
+bool g_manualHide = false;
+
+// Strictly controlled wake flags to avoid the GetLastInputInfo race condition
+bool g_pendingWake = false;
 static LONG g_mouseAccumX = 0;
 static LONG g_mouseAccumY = 0;
 static DWORD g_mouseAccumResetTick = 0;
 
 const wchar_t* APP_NAME = L"Hide Icons";
-const wchar_t* APP_VERSION = L"v1.9.2";
+const wchar_t* APP_VERSION = L"v1.9.4";
 
-// Registry keys (Only used for app settings now)
+// Registry keys
 const wchar_t* REG_PATH = L"SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Run";
 const wchar_t* SETTINGS_REG_PATH = L"SOFTWARE\\Hide Icons";
 const wchar_t* ICON_VALUE_NAME = L"CustomIcon";
@@ -58,6 +66,8 @@ const wchar_t* HOTKEY_VALUE_NAME = L"Hotkey";
 const wchar_t* HOTKEY_MODIFIER_VALUE_NAME = L"HotkeyModifier";
 const wchar_t* AUTOHIDE_SECONDS_VALUE_NAME = L"AutoHideSeconds";
 const wchar_t* AUTOHIDE_MINMOUSE_VALUE_NAME = L"AutoHideMinMouseMovement";
+const wchar_t* AUTOHIDE_ENABLE_VALUE_NAME = L"AutoHideEnable";
+const wchar_t* AUTOHIDE_HIDECURSOR_VALUE_NAME = L"AutoHideHideCursor";
 
 HICON hBlackIcon = (HICON)LoadImage(GetModuleHandle(nullptr), MAKEINTRESOURCE(IDI_ICON2), IMAGE_ICON, 0, 0, LR_DEFAULTSIZE);
 HICON hWhiteIcon = (HICON)LoadImage(GetModuleHandle(nullptr), MAKEINTRESOURCE(IDI_ICON3), IMAGE_ICON, 0, 0, LR_DEFAULTSIZE);
@@ -152,18 +162,33 @@ void SaveAutoHideConfig(const AutoHideConfig& config) {
     if (RegCreateKeyEx(HKEY_CURRENT_USER, SETTINGS_REG_PATH, 0, nullptr, 0, KEY_WRITE, nullptr, &hKey, nullptr) == ERROR_SUCCESS) {
         RegSetValueEx(hKey, AUTOHIDE_SECONDS_VALUE_NAME, 0, REG_DWORD, (const BYTE*)&config.inactivitySeconds, sizeof(config.inactivitySeconds));
         RegSetValueEx(hKey, AUTOHIDE_MINMOUSE_VALUE_NAME, 0, REG_DWORD, (const BYTE*)&config.minMouseMovement, sizeof(config.minMouseMovement));
+        DWORD enable = config.enableAutoHide ? 1 : 0;
+        RegSetValueEx(hKey, AUTOHIDE_ENABLE_VALUE_NAME, 0, REG_DWORD, (const BYTE*)&enable, sizeof(enable));
+        DWORD hideCursor = config.hideCursor ? 1 : 0;
+        RegSetValueEx(hKey, AUTOHIDE_HIDECURSOR_VALUE_NAME, 0, REG_DWORD, (const BYTE*)&hideCursor, sizeof(hideCursor));
         RegCloseKey(hKey);
     }
 }
 
 AutoHideConfig LoadAutoHideConfig() {
     HKEY hKey;
-    AutoHideConfig config = { 0, 25 };
+    AutoHideConfig config = { 0, 25, true, true };
     if (RegOpenKeyEx(HKEY_CURRENT_USER, SETTINGS_REG_PATH, 0, KEY_READ, &hKey) == ERROR_SUCCESS) {
-        DWORD dwType = 0, dwSize = sizeof(DWORD);
+        DWORD dwType = 0, dwSize = sizeof(DWORD), val = 0;
+
         RegQueryValueEx(hKey, AUTOHIDE_SECONDS_VALUE_NAME, 0, &dwType, (LPBYTE)&config.inactivitySeconds, &dwSize);
+
         dwSize = sizeof(DWORD);
         RegQueryValueEx(hKey, AUTOHIDE_MINMOUSE_VALUE_NAME, 0, &dwType, (LPBYTE)&config.minMouseMovement, &dwSize);
+
+        dwSize = sizeof(DWORD); val = 1;
+        if (RegQueryValueEx(hKey, AUTOHIDE_ENABLE_VALUE_NAME, 0, &dwType, (LPBYTE)&val, &dwSize) == ERROR_SUCCESS)
+            config.enableAutoHide = (val != 0);
+
+        dwSize = sizeof(DWORD); val = 1;
+        if (RegQueryValueEx(hKey, AUTOHIDE_HIDECURSOR_VALUE_NAME, 0, &dwType, (LPBYTE)&val, &dwSize) == ERROR_SUCCESS)
+            config.hideCursor = (val != 0);
+
         RegCloseKey(hKey);
     }
     return config;
@@ -175,6 +200,8 @@ AutoHideConfig LoadAutoHideConfig() {
 LRESULT CALLBACK AutoHideDialogProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) {
     switch (message) {
     case WM_INITDIALOG: {
+        CheckDlgButton(hWnd, IDC_AUTOHIDE_ENABLE_CHECK, g_autoHide.enableAutoHide ? BST_CHECKED : BST_UNCHECKED);
+        CheckDlgButton(hWnd, IDC_AUTOHIDE_HIDECURSOR_CHECK, g_autoHide.hideCursor ? BST_CHECKED : BST_UNCHECKED);
         SetDlgItemInt(hWnd, IDC_AUTOHIDE_SECONDS_EDIT, g_autoHide.inactivitySeconds, FALSE);
         SetDlgItemInt(hWnd, IDC_AUTOHIDE_MINMOUSE_EDIT, g_autoHide.minMouseMovement, FALSE);
 
@@ -191,7 +218,7 @@ LRESULT CALLBACK AutoHideDialogProc(HWND hWnd, UINT message, WPARAM wParam, LPAR
         int dialogHeight = dialogRect.bottom - dialogRect.top;
 
         if (cursorPos.x + dialogWidth > screenRect.right)  cursorPos.x = screenRect.right - dialogWidth - 10;
-        if (cursorPos.y + dialogHeight > screenRect.bottom)  cursorPos.y = screenRect.bottom - dialogHeight - 10;
+        if (cursorPos.y + dialogHeight > screenRect.bottom) cursorPos.y = screenRect.bottom - dialogHeight - 10;
 
         SetWindowPos(hWnd, HWND_TOP, cursorPos.x, cursorPos.y, 0, 0, SWP_NOZORDER | SWP_NOSIZE);
         return TRUE;
@@ -209,6 +236,8 @@ LRESULT CALLBACK AutoHideDialogProc(HWND hWnd, UINT message, WPARAM wParam, LPAR
 
             g_autoHide.inactivitySeconds = seconds;
             g_autoHide.minMouseMovement = minMouse;
+            g_autoHide.enableAutoHide = (IsDlgButtonChecked(hWnd, IDC_AUTOHIDE_ENABLE_CHECK) == BST_CHECKED);
+            g_autoHide.hideCursor = (IsDlgButtonChecked(hWnd, IDC_AUTOHIDE_HIDECURSOR_CHECK) == BST_CHECKED);
             SaveAutoHideConfig(g_autoHide);
             EndDialog(hWnd, IDOK);
             break;
@@ -247,7 +276,7 @@ LRESULT CALLBACK HotkeyDialogProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM
         int dialogHeight = dialogRect.bottom - dialogRect.top;
 
         if (cursorPos.x + dialogWidth > screenRect.right)  cursorPos.x = screenRect.right - dialogWidth - 10;
-        if (cursorPos.y + dialogHeight > screenRect.bottom)  cursorPos.y = screenRect.bottom - dialogHeight - 10;
+        if (cursorPos.y + dialogHeight > screenRect.bottom) cursorPos.y = screenRect.bottom - dialogHeight - 10;
 
         SetWindowPos(hWnd, HWND_TOP, cursorPos.x, cursorPos.y, 0, 0, SWP_NOZORDER | SWP_NOSIZE);
         return TRUE;
@@ -425,10 +454,9 @@ void RemoveTrayIcon() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// True Stealth Visibility & Cursor Control (Zero Flicker)
+// True Stealth Visibility & Cursor Control
 // ─────────────────────────────────────────────────────────────────────────────
 
-// Arrays to cache system cursors directly in memory
 HCURSOR g_savedCursors[13] = { nullptr };
 const DWORD g_cursorIDs[13] = {
     OCR_NORMAL, OCR_IBEAM, OCR_WAIT, OCR_CROSS, OCR_UP, OCR_SIZENWSE,
@@ -440,10 +468,8 @@ void SetCursorVisibility(bool show) {
     static bool isHidden = false;
 
     if (show && isHidden) {
-        // Restore locally stored cursors without sending a system-wide broadcast
         for (int i = 0; i < 13; ++i) {
             if (g_savedCursors[i]) {
-                // SetSystemCursor eats handles, so we provide an identical copy of our cache
                 HCURSOR hCopy = (HCURSOR)CopyImage(g_savedCursors[i], IMAGE_CURSOR, 0, 0, 0);
                 SetSystemCursor(hCopy, g_cursorIDs[i]);
             }
@@ -451,7 +477,6 @@ void SetCursorVisibility(bool show) {
         isHidden = false;
     }
     else if (!show && !isHidden) {
-        // Cache originals if not done yet
         for (int i = 0; i < 13; ++i) {
             if (!g_savedCursors[i]) {
                 HANDLE hSysCursor = LoadImage(nullptr, MAKEINTRESOURCE(g_cursorIDs[i]), IMAGE_CURSOR, 0, 0, LR_SHARED);
@@ -459,7 +484,6 @@ void SetCursorVisibility(bool show) {
             }
         }
 
-        // Create transparent cursors
         BYTE ANDmaskCursor[128];
         memset(ANDmaskCursor, 0xFF, sizeof(ANDmaskCursor));
         BYTE XORmaskCursor[128];
@@ -489,12 +513,10 @@ void SetDesktopIconsVisibility(bool show) {
 
     HWND hListView = FindWindowExW(defView, nullptr, L"SysListView32", nullptr);
     if (hListView) {
-        // Direct API visibility toggle. No registry touch, no shell broadcast.
         ShowWindow(hListView, show ? SW_SHOW : SW_HIDE);
     }
 }
 
-// Interrogates the actual window rather than the registry
 bool AreDesktopIconsCurrentlyVisible() {
     HWND defView = GetDefViewByCOM();
     if (!defView) defView = GetDefViewByScan();
@@ -504,55 +526,102 @@ bool AreDesktopIconsCurrentlyVisible() {
             return IsWindowVisible(hListView) != 0;
         }
     }
-    return true; // Assume visible if we fail to find the handle
+    return true;
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// State Transition Management
+// ─────────────────────────────────────────────────────────────────────────────
+
+void ResetWakeAccumulators() {
+    g_pendingWake = false;
+    g_mouseAccumX = 0;
+    g_mouseAccumY = 0;
+    g_mouseAccumResetTick = GetTickCount();
+}
+
+// Hide via auto-hide: hides icons and (if enabled) the cursor.
+// Does NOT set g_manualHide.
 void HideDesktopIcons() {
     if (!g_iconsHidden) {
         g_iconsHidden = true;
         SetDesktopIconsVisibility(false);
-        SetCursorVisibility(false);
+        if (g_autoHide.hideCursor) {
+            SetCursorVisibility(false);
+        }
+        ResetWakeAccumulators();
     }
 }
 
+// Show after auto-hide: restores icons and cursor.
+// Only called when g_manualHide is false.
 void ShowDesktopIcons() {
     if (g_iconsHidden) {
         g_iconsHidden = false;
         SetDesktopIconsVisibility(true);
-        SetCursorVisibility(true);
+        SetCursorVisibility(true); // always safe – no-op if cursor wasn't hidden
+        ResetWakeAccumulators();
     }
 }
 
+// Hide via hotkey: only hides icons, never the cursor.
+// Sets g_manualHide so auto-hide logic is suppressed.
+void ManualHideDesktopIcons() {
+    g_manualHide = true;
+    g_iconsHidden = true;
+    SetDesktopIconsVisibility(false);
+    // Cursor is intentionally left visible for manual hide.
+    ResetWakeAccumulators();
+}
+
+// Show after hotkey: restores icons, clears manual-hide flag.
+void ManualShowDesktopIcons() {
+    g_manualHide = false;
+    g_iconsHidden = false;
+    SetDesktopIconsVisibility(true);
+    SetCursorVisibility(true); // no-op if cursor wasn't hidden; safe to call
+    ResetWakeAccumulators();
+}
+
+// Called by tray left-click – behaves like the hotkey toggle.
 void ToggleDesktopIcons() {
-    g_iconsHidden = !g_iconsHidden;
-    SetDesktopIconsVisibility(!g_iconsHidden);
-    SetCursorVisibility(!g_iconsHidden);
+    if (g_iconsHidden) ManualShowDesktopIcons();
+    else               ManualHideDesktopIcons();
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Hooks & Timers
 // ─────────────────────────────────────────────────────────────────────────────
 LRESULT CALLBACK LowLevelMouseProc(int nCode, WPARAM wParam, LPARAM lParam) {
-    if (nCode == HC_ACTION && wParam == WM_MOUSEMOVE) {
-        static LONG lastX = LONG_MIN, lastY = LONG_MIN;
-        MSLLHOOKSTRUCT* p = reinterpret_cast<MSLLHOOKSTRUCT*>(lParam);
+    if (nCode == HC_ACTION) {
+        if (wParam == WM_MOUSEMOVE) {
+            static LONG lastX = LONG_MIN, lastY = LONG_MIN;
+            MSLLHOOKSTRUCT* p = reinterpret_cast<MSLLHOOKSTRUCT*>(lParam);
 
-        if (lastX != LONG_MIN) {
-            LONG dx = p->pt.x - lastX;
-            LONG dy = p->pt.y - lastY;
+            if (lastX != LONG_MIN) {
+                LONG dx = p->pt.x - lastX;
+                LONG dy = p->pt.y - lastY;
 
-            DWORD now = GetTickCount();
-            if (now - g_mouseAccumResetTick >= 1000) {
-                g_mouseAccumX = 0;
-                g_mouseAccumY = 0;
-                g_mouseAccumResetTick = now;
+                // Only accumulate if hidden AND not in manual-hide mode
+                if (g_iconsHidden && !g_manualHide) {
+                    DWORD now = GetTickCount();
+                    if (now - g_mouseAccumResetTick >= 1000) {
+                        g_mouseAccumX = 0;
+                        g_mouseAccumY = 0;
+                        g_mouseAccumResetTick = now;
+                    }
+                    g_mouseAccumX += (dx < 0 ? -dx : dx);
+                    g_mouseAccumY += (dy < 0 ? -dy : dy);
+                }
             }
-
-            g_mouseAccumX += (dx < 0 ? -dx : dx);
-            g_mouseAccumY += (dy < 0 ? -dy : dy);
+            lastX = p->pt.x;
+            lastY = p->pt.y;
         }
-        lastX = p->pt.x;
-        lastY = p->pt.y;
+        else if (wParam == WM_LBUTTONDOWN || wParam == WM_RBUTTONDOWN ||
+            wParam == WM_MBUTTONDOWN || wParam == WM_MOUSEWHEEL) {
+            // Clicks/scrolls wake the system only when auto-hidden (not manual-hidden)
+            if (g_iconsHidden && !g_manualHide) g_pendingWake = true;
+        }
     }
     return CallNextHookEx(g_hMouseHook, nCode, wParam, lParam);
 }
@@ -562,16 +631,35 @@ LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lParam) {
         KBDLLHOOKSTRUCT* pKeyInfo = (KBDLLHOOKSTRUCT*)lParam;
         bool isKeyDown = (wParam == WM_KEYDOWN || wParam == WM_SYSKEYDOWN);
 
-        if (isKeyDown && g_hotkey.hotkey != 0 && pKeyInfo->vkCode == g_hotkey.hotkey) {
-            bool ctrlPressed = (GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0;
-            bool shiftPressed = (GetAsyncKeyState(VK_SHIFT) & 0x8000) != 0;
-            bool altPressed = (GetAsyncKeyState(VK_MENU) & 0x8000) != 0;
+        if (isKeyDown) {
+            bool isHotkey = false;
 
-            if ((g_hotkey.modifier & MOD_CONTROL) == (ctrlPressed ? MOD_CONTROL : 0) &&
-                (g_hotkey.modifier & MOD_SHIFT) == (shiftPressed ? MOD_SHIFT : 0) &&
-                (g_hotkey.modifier & MOD_ALT) == (altPressed ? MOD_ALT : 0))
-            {
-                ToggleDesktopIcons();
+            if (g_hotkey.hotkey != 0 && pKeyInfo->vkCode == g_hotkey.hotkey) {
+                bool ctrlPressed = (GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0;
+                bool shiftPressed = (GetAsyncKeyState(VK_SHIFT) & 0x8000) != 0;
+                bool altPressed = (GetAsyncKeyState(VK_MENU) & 0x8000) != 0;
+
+                if ((g_hotkey.modifier & MOD_CONTROL) == (ctrlPressed ? MOD_CONTROL : 0) &&
+                    (g_hotkey.modifier & MOD_SHIFT) == (shiftPressed ? MOD_SHIFT : 0) &&
+                    (g_hotkey.modifier & MOD_ALT) == (altPressed ? MOD_ALT : 0))
+                {
+                    // Hotkey pressed: always toggle, regardless of manual/auto mode
+                    if (g_manualHide || !g_iconsHidden) {
+                        // Currently manually hidden, or visible → use manual-hide path
+                        if (g_iconsHidden) ManualShowDesktopIcons();
+                        else               ManualHideDesktopIcons();
+                    }
+                    else {
+                        // Currently auto-hidden → hotkey cancels auto-hide and shows
+                        ShowDesktopIcons();
+                    }
+                    isHotkey = true;
+                }
+            }
+
+            // Any key that isn't the hotkey wakes the system only in auto-hide mode
+            if (!isHotkey && g_iconsHidden && !g_manualHide) {
+                g_pendingWake = true;
             }
         }
     }
@@ -595,30 +683,26 @@ void UninstallMouseHook() {
 }
 
 void OnAutoHideTimer() {
-    if (g_autoHide.inactivitySeconds == 0) return;
-
-    LASTINPUTINFO lii;
-    lii.cbSize = sizeof(LASTINPUTINFO);
-    if (!GetLastInputInfo(&lii)) return;
-
-    DWORD idleMs = GetTickCount() - lii.dwTime;
+    // If auto-hide is disabled, or we're in manual-hide mode, do nothing.
+    if (!g_autoHide.enableAutoHide) return;
+    if (g_manualHide) return;
 
     if (!g_iconsHidden) {
+        // inactivitySeconds == 0 means auto-hide is effectively off
+        if (g_autoHide.inactivitySeconds == 0) return;
+
+        LASTINPUTINFO lii;
+        lii.cbSize = sizeof(LASTINPUTINFO);
+        if (!GetLastInputInfo(&lii)) return;
+
+        DWORD idleMs = GetTickCount() - lii.dwTime;
         if (idleMs >= g_autoHide.inactivitySeconds * 1000U) {
             HideDesktopIcons();
         }
     }
     else {
         LONG totalMovement = g_mouseAccumX + g_mouseAccumY;
-        if (totalMovement >= (LONG)g_autoHide.minMouseMovement) {
-            g_mouseAccumX = 0;
-            g_mouseAccumY = 0;
-            g_mouseAccumResetTick = GetTickCount();
-            ShowDesktopIcons();
-            return;
-        }
-
-        if (idleMs < 500) {
+        if (totalMovement >= (LONG)g_autoHide.minMouseMovement || g_pendingWake) {
             ShowDesktopIcons();
         }
     }
@@ -700,8 +784,11 @@ int APIENTRY wWinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE hPrevInstance
 
     g_hInstance = hInstance;
 
-    // Sync logical state directly with the active window visibility
+    // Sync logical state with the live window visibility
     g_iconsHidden = !AreDesktopIconsCurrentlyVisible();
+    // If icons are already hidden at startup we can't know whether it was manual
+    // or auto – treat it as manual so the hotkey is required to restore them.
+    if (g_iconsHidden) g_manualHide = true;
 
     WNDCLASS wc = {};
     wc.lpfnWndProc = WndProc;
@@ -715,7 +802,7 @@ int APIENTRY wWinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE hPrevInstance
     g_hotkey = LoadHotkey();
     g_autoHide = LoadAutoHideConfig();
 
-    g_mouseAccumResetTick = GetTickCount();
+    ResetWakeAccumulators();
 
     InstallKeyboardHook();
     InstallMouseHook();
