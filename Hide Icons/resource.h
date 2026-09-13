@@ -16,6 +16,7 @@
 #define IDC_AUTOHIDE_MINMOUSE_EDIT     2006
 #define IDC_AUTOHIDE_ENABLE_CHECK      2007
 #define IDC_AUTOHIDE_HIDECURSOR_CHECK  2008
+#define IDC_AUTOHIDE_STARTUP_CHECK     2009
 
 // Next default values for new objects
 // 

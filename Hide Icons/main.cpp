@@ -26,6 +26,7 @@ struct AutoHideConfig {
     UINT  minMouseMovement;
     bool  enableAutoHide;   // master on/off for the auto-hide feature
     bool  hideCursor;       // whether to also hide the cursor in auto-hide mode
+    bool  hideAtStartup;    // hide icons at boot/login, "manual-hide" style, until toggled off
 };
 
 // Global variables
@@ -36,7 +37,7 @@ bool g_isStartup = false;
 HHOOK g_hKeyboardHook = nullptr;
 HHOOK g_hMouseHook = nullptr;
 HotkeyConfig g_hotkey = { 0, 0 };
-AutoHideConfig g_autoHide = { 0, 25, true, true };
+AutoHideConfig g_autoHide = { 0, 25, true, true, false };
 std::wstring customIconPath;
 
 // Auto-hide state
@@ -68,6 +69,7 @@ const wchar_t* AUTOHIDE_SECONDS_VALUE_NAME = L"AutoHideSeconds";
 const wchar_t* AUTOHIDE_MINMOUSE_VALUE_NAME = L"AutoHideMinMouseMovement";
 const wchar_t* AUTOHIDE_ENABLE_VALUE_NAME = L"AutoHideEnable";
 const wchar_t* AUTOHIDE_HIDECURSOR_VALUE_NAME = L"AutoHideHideCursor";
+const wchar_t* AUTOHIDE_STARTUP_VALUE_NAME = L"AutoHideHideAtStartup";
 
 HICON hBlackIcon = (HICON)LoadImage(GetModuleHandle(nullptr), MAKEINTRESOURCE(IDI_ICON2), IMAGE_ICON, 0, 0, LR_DEFAULTSIZE);
 HICON hWhiteIcon = (HICON)LoadImage(GetModuleHandle(nullptr), MAKEINTRESOURCE(IDI_ICON3), IMAGE_ICON, 0, 0, LR_DEFAULTSIZE);
@@ -166,13 +168,15 @@ void SaveAutoHideConfig(const AutoHideConfig& config) {
         RegSetValueEx(hKey, AUTOHIDE_ENABLE_VALUE_NAME, 0, REG_DWORD, (const BYTE*)&enable, sizeof(enable));
         DWORD hideCursor = config.hideCursor ? 1 : 0;
         RegSetValueEx(hKey, AUTOHIDE_HIDECURSOR_VALUE_NAME, 0, REG_DWORD, (const BYTE*)&hideCursor, sizeof(hideCursor));
+        DWORD hideAtStartup = config.hideAtStartup ? 1 : 0;
+        RegSetValueEx(hKey, AUTOHIDE_STARTUP_VALUE_NAME, 0, REG_DWORD, (const BYTE*)&hideAtStartup, sizeof(hideAtStartup));
         RegCloseKey(hKey);
     }
 }
 
 AutoHideConfig LoadAutoHideConfig() {
     HKEY hKey;
-    AutoHideConfig config = { 0, 25, true, true };
+    AutoHideConfig config = { 0, 25, true, true, false };
     if (RegOpenKeyEx(HKEY_CURRENT_USER, SETTINGS_REG_PATH, 0, KEY_READ, &hKey) == ERROR_SUCCESS) {
         DWORD dwType = 0, dwSize = sizeof(DWORD), val = 0;
 
@@ -189,6 +193,10 @@ AutoHideConfig LoadAutoHideConfig() {
         if (RegQueryValueEx(hKey, AUTOHIDE_HIDECURSOR_VALUE_NAME, 0, &dwType, (LPBYTE)&val, &dwSize) == ERROR_SUCCESS)
             config.hideCursor = (val != 0);
 
+        dwSize = sizeof(DWORD); val = 0;
+        if (RegQueryValueEx(hKey, AUTOHIDE_STARTUP_VALUE_NAME, 0, &dwType, (LPBYTE)&val, &dwSize) == ERROR_SUCCESS)
+            config.hideAtStartup = (val != 0);
+
         RegCloseKey(hKey);
     }
     return config;
@@ -202,6 +210,7 @@ LRESULT CALLBACK AutoHideDialogProc(HWND hWnd, UINT message, WPARAM wParam, LPAR
     case WM_INITDIALOG: {
         CheckDlgButton(hWnd, IDC_AUTOHIDE_ENABLE_CHECK, g_autoHide.enableAutoHide ? BST_CHECKED : BST_UNCHECKED);
         CheckDlgButton(hWnd, IDC_AUTOHIDE_HIDECURSOR_CHECK, g_autoHide.hideCursor ? BST_CHECKED : BST_UNCHECKED);
+        CheckDlgButton(hWnd, IDC_AUTOHIDE_STARTUP_CHECK, g_autoHide.hideAtStartup ? BST_CHECKED : BST_UNCHECKED);
         SetDlgItemInt(hWnd, IDC_AUTOHIDE_SECONDS_EDIT, g_autoHide.inactivitySeconds, FALSE);
         SetDlgItemInt(hWnd, IDC_AUTOHIDE_MINMOUSE_EDIT, g_autoHide.minMouseMovement, FALSE);
 
@@ -238,6 +247,7 @@ LRESULT CALLBACK AutoHideDialogProc(HWND hWnd, UINT message, WPARAM wParam, LPAR
             g_autoHide.minMouseMovement = minMouse;
             g_autoHide.enableAutoHide = (IsDlgButtonChecked(hWnd, IDC_AUTOHIDE_ENABLE_CHECK) == BST_CHECKED);
             g_autoHide.hideCursor = (IsDlgButtonChecked(hWnd, IDC_AUTOHIDE_HIDECURSOR_CHECK) == BST_CHECKED);
+            g_autoHide.hideAtStartup = (IsDlgButtonChecked(hWnd, IDC_AUTOHIDE_STARTUP_CHECK) == BST_CHECKED);
             SaveAutoHideConfig(g_autoHide);
             EndDialog(hWnd, IDOK);
             break;
@@ -801,6 +811,16 @@ int APIENTRY wWinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE hPrevInstance
 
     g_hotkey = LoadHotkey();
     g_autoHide = LoadAutoHideConfig();
+
+    // "Hide icons at boot/login" setting: hide the icons using the exact same
+    // code path as the hotkey/tray-click toggle (ManualHideDesktopIcons), so
+    // the cursor stays visible and the icons stay hidden permanently until the
+    // user explicitly toggles them back on (hotkey or tray left-click). This
+    // is intentionally independent of the inactivity-based auto-hide feature,
+    // which would otherwise auto-restore icons on mouse movement.
+    if (g_autoHide.hideAtStartup) {
+        ManualHideDesktopIcons();
+    }
 
     ResetWakeAccumulators();
 
